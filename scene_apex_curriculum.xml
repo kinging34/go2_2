@@ -1,0 +1,57 @@
+<mujoco model="go2 apex-style curriculum terrain">
+  <!--
+    Five procedural heightfield strips are populated by the accompanying notebook.
+    Each strip contains ten 8 m x 8 m difficulty patches arranged along X.
+    Keep this file beside go2.xml and the assets/ directory.
+  -->
+  <include file="go2.xml"/>
+
+  <statistic center="0 0 0.2" extent="45"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-125" elevation="-22"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072"/>
+    <texture type="2d" name="terrain_tex" builtin="checker" mark="edge"
+             rgb1="0.20 0.24 0.20" rgb2="0.10 0.13 0.10" markrgb="0.7 0.7 0.7"
+             width="300" height="300"/>
+    <material name="terrain_mat" texture="terrain_tex" texuniform="true"
+              texrepeat="20 2" reflectance="0.05"/>
+
+    <!-- nrow is the 8 m lateral direction; ncol is ten 8 m patches along X. -->
+    <hfield name="terrain_t0" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
+    <hfield name="terrain_t1" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
+    <hfield name="terrain_t2" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
+    <hfield name="terrain_t3" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
+    <hfield name="terrain_t4" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 8" dir="0 0 -1" directional="true"/>
+
+    <!-- The five strips use different friction values to provide friction diversity. -->
+    <geom name="terrain_geom_t0" type="hfield" hfield="terrain_t0" pos="0 -20 -1.5"
+          material="terrain_mat" friction="0.35 0.02 0.01" condim="3"/>
+    <geom name="terrain_geom_t1" type="hfield" hfield="terrain_t1" pos="0 -10 -1.5"
+          material="terrain_mat" friction="0.55 0.02 0.01" condim="3"/>
+    <geom name="terrain_geom_t2" type="hfield" hfield="terrain_t2" pos="0 0 -1.5"
+          material="terrain_mat" friction="0.75 0.02 0.01" condim="3"/>
+    <geom name="terrain_geom_t3" type="hfield" hfield="terrain_t3" pos="0 10 -1.5"
+          material="terrain_mat" friction="1.00 0.02 0.01" condim="3"/>
+    <geom name="terrain_geom_t4" type="hfield" hfield="terrain_t4" pos="0 20 -1.5"
+          material="terrain_mat" friction="1.25 0.02 0.01" condim="3"/>
+
+    <!-- A low catch floor prevents an unrecoverable free fall outside a strip. -->
+    <geom name="catch_floor" type="plane" pos="0 0 -1.82" size="0 0 0.05"
+          rgba="0.08 0.10 0.08 1" friction="0.8 0.02 0.01" condim="3"/>
+
+    <camera name="track" mode="trackcom" pos="0 -2.3 0.75" xyaxes="1 0 0 0 0.24 1"/>
+    <camera name="side" mode="trackcom" pos="0 -2.0 0.30" xyaxes="1 0 0 0 0 1"/>
+    <camera name="overview" pos="43 -31 28" xyaxes="0.58 0.81 0 -0.36 0.26 0.90"/>
+  </worldbody>
+</mujoco>

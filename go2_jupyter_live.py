@@ -38,10 +38,10 @@ if _missing:
 # Performance profile.  Physics remains at 50 Hz; only browser video is reduced.
 # Increase LIVE_RENDER_HZ to 15 or LIVE_WIDTH/HEIGHT to 480/360 if the connection
 # and browser can keep up.
-LIVE_WIDTH = int(globals().get("LIVE_WIDTH", 320))
-LIVE_HEIGHT = int(globals().get("LIVE_HEIGHT", 240))
-LIVE_RENDER_HZ = int(globals().get("LIVE_RENDER_HZ", 25))
-LIVE_JPEG_QUALITY = int(globals().get("LIVE_JPEG_QUALITY", 80))
+LIVE_WIDTH = int(globals().get("LIVE_WIDTH", 280))
+LIVE_HEIGHT = int(globals().get("LIVE_HEIGHT", 200))
+LIVE_RENDER_HZ = int(globals().get("LIVE_RENDER_HZ", 30))
+LIVE_JPEG_QUALITY = int(globals().get("LIVE_JPEG_QUALITY", 100))
 
 
 # Stop an older controller if this file is run again.

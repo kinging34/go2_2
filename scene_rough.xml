@@ -1,0 +1,125 @@
+<mujoco model="go2 starter rough terrain">
+  <!--
+    Starter uneven terrain for go2_imitation_warp_release(1).ipynb.
+
+    Design goals:
+      * Keep a 2.4 m x 2.4 m flat spawn area around the origin.
+      * Introduce low 1.5 to 6 cm steps, uneven patches, and friction changes.
+      * Use only plane and box primitives for predictable MuJoCo Warp collisions.
+      * Keep the terrain mild because the current policy does not observe terrain
+        height and its height reward/termination use absolute world height.
+
+    The file must remain beside go2.xml and the assets/ directory.
+  -->
+  <include file="go2.xml"/>
+
+  <statistic center="0 0 0.15" extent="3.8"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="-130" elevation="-22"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0"
+             width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.16 0.20 0.24" rgb2="0.08 0.11 0.14" markrgb="0.7 0.7 0.7"
+             width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true"
+              texrepeat="8 8" reflectance="0.1"/>
+    <material name="spawn_mat" rgba="0.24 0.30 0.34 1"/>
+    <material name="rough_a" rgba="0.38 0.31 0.23 1"/>
+    <material name="rough_b" rgba="0.46 0.38 0.27 1"/>
+    <material name="step_mat" rgba="0.34 0.36 0.38 1"/>
+    <material name="slip_mat" rgba="0.24 0.36 0.46 1" reflectance="0.25"/>
+    <material name="obstacle_mat" rgba="0.48 0.30 0.20 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 4" dir="0 0 -1" directional="true"/>
+
+    <!-- Safety floor. The rough tiles sit above it; outside the course is an 8 cm drop. -->
+    <geom name="safety_floor" type="plane" pos="0 0 -0.08" size="0 0 0.05"
+          material="groundplane" friction="0.65 0.02 0.01" condim="3"/>
+
+    <!-- Flat spawn/reset area: top surface z = 0. -->
+    <geom name="spawn_pad" type="box" pos="0 0 -0.04" size="1.20 1.20 0.04"
+          material="spawn_mat" friction="0.75 0.02 0.01" condim="3" margin="0"/>
+
+    <!-- +X lane: progressively higher low stairs, followed by a descent. -->
+    <geom name="step_fwd_01" type="box" pos="1.575 0 -0.035" size="0.375 1.20 0.05"
+          material="step_mat" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="step_fwd_02" type="box" pos="2.325 0 -0.020" size="0.375 1.20 0.05"
+          material="step_mat" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="step_fwd_03" type="box" pos="3.075 0 -0.005" size="0.375 1.20 0.05"
+          material="step_mat" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="step_fwd_04" type="box" pos="3.825 0 0.010" size="0.375 1.20 0.05"
+          material="step_mat" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="step_fwd_05" type="box" pos="4.575 0 -0.005" size="0.375 1.20 0.05"
+          material="step_mat" friction="0.65 0.02 0.01" condim="3" margin="0"/>
+    <geom name="step_fwd_06" type="box" pos="5.325 0 -0.025" size="0.375 1.20 0.05"
+          material="step_mat" friction="0.60 0.02 0.01" condim="3" margin="0"/>
+
+    <!-- -X lane: uneven bands with alternating height and friction. -->
+    <geom name="rough_back_01" type="box" pos="-1.575 0 -0.030" size="0.375 1.20 0.05"
+          material="rough_a" friction="0.80 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_back_02" type="box" pos="-2.325 0 -0.045" size="0.375 1.20 0.05"
+          material="rough_b" friction="0.55 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_back_03" type="box" pos="-3.075 0 -0.015" size="0.375 1.20 0.05"
+          material="rough_a" friction="0.75 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_back_04" type="box" pos="-3.825 0 -0.040" size="0.375 1.20 0.05"
+          material="rough_b" friction="0.45 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_back_05" type="box" pos="-4.575 0 0.000" size="0.375 1.20 0.05"
+          material="rough_a" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_back_06" type="box" pos="-5.325 0 -0.025" size="0.375 1.20 0.05"
+          material="rough_b" friction="0.60 0.02 0.01" condim="3" margin="0"/>
+
+    <!-- +Y lane: low stepping bands. -->
+    <geom name="rough_left_01" type="box" pos="0 1.575 -0.035" size="1.20 0.375 0.05"
+          material="rough_b" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_left_02" type="box" pos="0 2.325 -0.015" size="1.20 0.375 0.05"
+          material="rough_a" friction="0.75 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_left_03" type="box" pos="0 3.075 -0.040" size="1.20 0.375 0.05"
+          material="rough_b" friction="0.50 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_left_04" type="box" pos="0 3.825 -0.005" size="1.20 0.375 0.05"
+          material="rough_a" friction="0.80 0.02 0.01" condim="3" margin="0"/>
+    <geom name="rough_left_05" type="box" pos="0 4.575 -0.030" size="1.20 0.375 0.05"
+          material="rough_b" friction="0.60 0.02 0.01" condim="3" margin="0"/>
+
+    <!-- -Y lane: a deliberately lower-friction sequence. -->
+    <geom name="slip_right_01" type="box" pos="0 -1.575 -0.040" size="1.20 0.375 0.05"
+          material="slip_mat" friction="0.35 0.01 0.005" condim="3" margin="0"/>
+    <geom name="slip_right_02" type="box" pos="0 -2.325 -0.025" size="1.20 0.375 0.05"
+          material="slip_mat" friction="0.25 0.01 0.005" condim="3" margin="0"/>
+    <geom name="slip_right_03" type="box" pos="0 -3.075 -0.010" size="1.20 0.375 0.05"
+          material="slip_mat" friction="0.20 0.01 0.005" condim="3" margin="0"/>
+    <geom name="slip_right_04" type="box" pos="0 -3.825 -0.030" size="1.20 0.375 0.05"
+          material="slip_mat" friction="0.30 0.01 0.005" condim="3" margin="0"/>
+    <geom name="slip_right_05" type="box" pos="0 -4.575 -0.020" size="1.20 0.375 0.05"
+          material="slip_mat" friction="0.25 0.01 0.005" condim="3" margin="0"/>
+
+    <!-- Sparse low obstacles for turning and diagonal motion. Top heights are 3 to 5 cm. -->
+    <geom name="block_ne_01" type="box" pos="1.75 1.90 -0.025" size="0.40 0.32 0.075"
+          material="obstacle_mat" friction="0.75 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_ne_02" type="box" pos="2.75 2.45 -0.035" size="0.30 0.45 0.075"
+          material="obstacle_mat" friction="0.70 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_nw_01" type="box" pos="-1.80 1.85 -0.030" size="0.35 0.40 0.075"
+          material="obstacle_mat" friction="0.75 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_nw_02" type="box" pos="-2.80 2.60 -0.025" size="0.45 0.30 0.075"
+          material="obstacle_mat" friction="0.65 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_se_01" type="box" pos="1.85 -1.85 -0.035" size="0.38 0.36 0.075"
+          material="obstacle_mat" friction="0.45 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_se_02" type="box" pos="2.75 -2.55 -0.025" size="0.32 0.42 0.075"
+          material="obstacle_mat" friction="0.40 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_sw_01" type="box" pos="-1.90 -1.80 -0.030" size="0.42 0.32 0.075"
+          material="obstacle_mat" friction="0.55 0.02 0.01" condim="3" margin="0"/>
+    <geom name="block_sw_02" type="box" pos="-2.70 -2.55 -0.035" size="0.35 0.45 0.075"
+          material="obstacle_mat" friction="0.50 0.02 0.01" condim="3" margin="0"/>
+
+    <camera name="track" mode="trackcom" pos="0 -2.3 0.75" xyaxes="1 0 0 0 0.24 1"/>
+    <camera name="side" mode="trackcom" pos="0 -2.0 0.30" xyaxes="1 0 0 0 0 1"/>
+    <camera name="overview" pos="6 -7 6" xyaxes="0.76 0.65 0 -0.34 0.40 0.85"/>
+  </worldbody>
+</mujoco>
