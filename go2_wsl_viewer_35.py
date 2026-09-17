@@ -62,8 +62,7 @@ LEGS = [
 ]
 QPOS_ORDER = ["FL", "FR", "RL", "RR"]
 
-BASE_OBS_DIM, PRIOR_OBS_DIM, ACT_DIM = 35, 36, 12
-SUPPORTED_OBS_DIMS = (BASE_OBS_DIM, PRIOR_OBS_DIM)
+OBS_DIM, ACT_DIM = 35, 12
 ENCODER_POP_DIM, DECODER_POP_DIM = 64, 256
 HIDDEN_SIZES = (256, 256, ACT_DIM * 2 * DECODER_POP_DIM)
 MEM_DIM = sum(HIDDEN_SIZES)
@@ -221,15 +220,6 @@ class BatchTrot:
         qvel[:, 6:] = (qpos1[:, 7:] - qpos0[:, 7:]) / (2 * eps)
         return qvel
 
-    def joint_cycle(
-        self, command: torch.Tensor, swing_height: torch.Tensor, dt: float
-    ) -> np.ndarray:
-        """Return one gait cycle in MuJoCo qpos joint order."""
-        times = torch.arange(CYC, dtype=torch.float64) * dt
-        commands = command.reshape(1, 3).expand(CYC, -1)
-        swings = swing_height.reshape(1).expand(CYC)
-        return self.qpos_at(commands, times, swings)[:, 7:].numpy()
-
 
 # ---------------------------------------------------------------------------
 # CPU MuJoCo environment
@@ -260,23 +250,12 @@ class Go2CpuEnv:
         preset: str = "balanced",
         reset_noise: float = 0.0,
         seed: int = 0,
-        actor_obs_dim: int = BASE_OBS_DIM,
-        prior_factor: float = 0.0,
     ):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.data = mujoco.MjData(self.model)
         self.max_steps = max_steps
         self.reset_noise = reset_noise
         self.rng = np.random.default_rng(seed)
-        if actor_obs_dim not in SUPPORTED_OBS_DIMS:
-            raise ValueError(
-                f"Unsupported actor observation dimension {actor_obs_dim}; "
-                f"expected one of {SUPPORTED_OBS_DIMS}"
-            )
-        if not 0.0 <= prior_factor <= 1.0:
-            raise ValueError("prior_factor must be between 0 and 1")
-        self.actor_obs_dim = actor_obs_dim
-        self.prior_factor = float(prior_factor)
 
         if self.model.nu != ACT_DIM:
             raise ValueError(f"Expected {ACT_DIM} actuators, found {self.model.nu}")
@@ -320,7 +299,6 @@ class Go2CpuEnv:
         self.trot = BatchTrot()
         self.phase_offset = 0
         self.step_count = 0
-        self.q_table = np.zeros((CYC, ACT_DIM), dtype=np.float64)
 
         standing = standing_pose(H0)
         self.default_sensor_position = standing[self.PERM]
@@ -341,11 +319,6 @@ class Go2CpuEnv:
             command[:] = 0.0
         self.command[:] = command
         self.swing_height = H_SWING if np.any(command != 0.0) else 0.0
-        command_tensor = torch.as_tensor(self.command, dtype=torch.float64)
-        swing_tensor = torch.tensor(self.swing_height, dtype=torch.float64)
-        self.q_table[:] = self.trot.joint_cycle(
-            command_tensor, swing_tensor, self.dt
-        )
 
     def reset(self, command: np.ndarray) -> torch.Tensor:
         self.set_command(command)
@@ -377,33 +350,23 @@ class Go2CpuEnv:
         angle = sensor[self.a_pos : self.a_pos + 12] - self.default_sensor_position
         velocity = sensor[self.a_vel : self.a_vel + 12]
         phase = 2.0 * np.pi * self.phase() / CYC
-        parts = [
-            np.stack([angle, velocity], axis=-1).reshape(24),
-            sensor[self.a_gyro : self.a_gyro + 3],
-            sensor[self.a_acc : self.a_acc + 3],
-            self.command / CMD_SCALE,
-            np.asarray([np.sin(phase), np.cos(phase)]),
-        ]
-        if self.actor_obs_dim == PRIOR_OBS_DIM:
-            parts.append(np.asarray([self.prior_factor]))
-        observation = np.concatenate(parts).astype(np.float32, copy=False)
-        if observation.shape != (self.actor_obs_dim,):
-            raise RuntimeError(
-                f"Expected observation shape {(self.actor_obs_dim,)}, "
-                f"got {observation.shape}"
-            )
+        observation = np.concatenate(
+            [
+                np.stack([angle, velocity], axis=-1).reshape(24),
+                sensor[self.a_gyro : self.a_gyro + 3],
+                sensor[self.a_acc : self.a_acc + 3],
+                self.command / CMD_SCALE,
+                np.asarray([np.sin(phase), np.cos(phase)]),
+            ]
+        ).astype(np.float32, copy=False)
+        if observation.shape != (OBS_DIM,):
+            raise RuntimeError(f"Expected observation shape {(OBS_DIM,)}, got {observation.shape}")
         return torch.from_numpy(observation.copy()).unsqueeze(0)
 
     def step(self, action: torch.Tensor):
         action_np = action.detach().cpu().numpy().reshape(ACT_DIM)
-        prior = 0.0
-        if self.actor_obs_dim == PRIOR_OBS_DIM and self.prior_factor > 0.0:
-            reference_sensor = self.q_table[self.phase()][self.PERM]
-            prior = self.prior_factor * (
-                reference_sensor - self.default_sensor_position
-            )
         self.target[:] = np.clip(
-            self.default_sensor_position + action_np * ACT_SCALE + prior,
+            self.default_sensor_position + action_np * ACT_SCALE,
             self.joint_low,
             self.joint_high,
         )
@@ -461,20 +424,19 @@ def lif_step(current: torch.Tensor, previous: torch.Tensor):
 
 
 class Encoder(nn.Module):
-    def __init__(self, obs_dim: int):
+    def __init__(self):
         super().__init__()
-        self.obs_dim = obs_dim
         self.activation = nn.Tanh()
-        self.register_buffer("zeros", torch.zeros(1, obs_dim * 2), persistent=False)
-        self.weight = nn.Parameter(torch.ones(1, obs_dim))
-        self.bias = nn.Parameter(torch.zeros(1, obs_dim))
+        self.register_buffer("zeros", torch.zeros(1, OBS_DIM * 2), persistent=False)
+        self.weight = nn.Parameter(torch.ones(1, OBS_DIM))
+        self.bias = nn.Parameter(torch.zeros(1, OBS_DIM))
 
     def forward(self, observation: torch.Tensor) -> torch.Tensor:
         value = self.activation(observation * self.weight + self.bias)
         probability = torch.maximum(torch.cat([value, -value], dim=1), self.zeros)
         noise = torch.rand(
             probability.shape[0],
-            self.obs_dim * 2,
+            OBS_DIM * 2,
             ENCODER_POP_DIM,
             device=probability.device,
             dtype=probability.dtype,
@@ -498,13 +460,12 @@ class Decoder(nn.Module):
 
 
 class SpikeActor(nn.Module):
-    def __init__(self, obs_dim: int):
+    def __init__(self):
         super().__init__()
-        self.obs_dim = obs_dim
-        self.Linear1 = nn.Linear(obs_dim * 2 * ENCODER_POP_DIM, HIDDEN_SIZES[0])
+        self.Linear1 = nn.Linear(OBS_DIM * 2 * ENCODER_POP_DIM, HIDDEN_SIZES[0])
         self.Linear2 = nn.Linear(HIDDEN_SIZES[0], HIDDEN_SIZES[1])
         self.Linear3 = nn.Linear(HIDDEN_SIZES[1], HIDDEN_SIZES[2])
-        self.encoder = Encoder(obs_dim)
+        self.encoder = Encoder()
         self.decoder = Decoder()
         self.p1 = HIDDEN_SIZES[0]
         self.p2 = HIDDEN_SIZES[0] + HIDDEN_SIZES[1]
@@ -521,6 +482,7 @@ class SpikeActor(nn.Module):
 
 
 def load_actor(checkpoint: Path) -> SpikeActor:
+    actor = SpikeActor()
     try:
         state = torch.load(checkpoint, map_location="cpu", weights_only=True)
     except TypeError:  # PyTorch older than weights_only support
@@ -532,45 +494,23 @@ def load_actor(checkpoint: Path) -> SpikeActor:
     }
     for key in [name for name in state if name.startswith("lif")]:
         state.pop(key)
-    encoder_weight = state.get("encoder.weight")
-    if encoder_weight is None or encoder_weight.ndim != 2:
-        raise RuntimeError("Checkpoint does not contain a valid encoder.weight")
-    obs_dim = int(encoder_weight.shape[1])
-    if obs_dim not in SUPPORTED_OBS_DIMS:
-        raise RuntimeError(
-            f"Checkpoint actor observation dimension is {obs_dim}; "
-            f"supported dimensions are {SUPPORTED_OBS_DIMS}"
-        )
-    actor = SpikeActor(obs_dim)
     actor.load_state_dict(state)
     actor.eval()
     return actor
 
 
-def load_normalizer(path: Path, actor_obs_dim: int):
+def load_normalizer(path: Path):
     values = np.load(path)
-    mean_values = np.asarray(values["mean"]).reshape(-1)
-    variance_values = np.asarray(values["var"]).reshape(-1)
-    if mean_values.size < actor_obs_dim or variance_values.size < actor_obs_dim:
-        raise ValueError(
-            f"Normalizer has {mean_values.size} mean and {variance_values.size} "
-            f"variance values, but actor requires {actor_obs_dim}"
-        )
-    mean = torch.as_tensor(mean_values[:actor_obs_dim], dtype=torch.float32)
-    variance = torch.as_tensor(variance_values[:actor_obs_dim], dtype=torch.float32)
+    mean = torch.as_tensor(values["mean"], dtype=torch.float32)
+    variance = torch.as_tensor(values["var"], dtype=torch.float32)
 
     def normalize(observation: torch.Tensor) -> torch.Tensor:
         eps = torch.finfo(torch.float32).eps
-        normalized = torch.clamp(
+        return torch.clamp(
             (observation - mean) / torch.sqrt(variance + eps),
             -NORM_CLIP_LIMIT,
             NORM_CLIP_LIMIT,
         )
-        # The new 36-D policy receives the raw action-prior coefficient.  The
-        # training notebook restores this column after normalizing actor input.
-        if actor_obs_dim == PRIOR_OBS_DIM:
-            normalized = torch.cat([normalized[:, :-1], observation[:, -1:]], dim=1)
-        return normalized
 
     return normalize
 
@@ -596,15 +536,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="reset after this many control steps; 0 disables timeout resets",
     )
     parser.add_argument("--reset-noise", type=float, default=0.0)
-    parser.add_argument(
-        "--prior-factor",
-        type=float,
-        default=0.0,
-        help=(
-            "analytic gait assistance for the 36-D policy (0=evaluation default, "
-            "1=full assistance)"
-        ),
-    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--torch-threads", type=int, default=1)
     parser.add_argument("--report-interval", type=float, default=2.0)
@@ -630,8 +561,6 @@ def main() -> None:
         )
     if args.torch_threads < 1:
         raise ValueError("--torch-threads must be at least 1")
-    if not 0.0 <= args.prior_factor <= 1.0:
-        raise ValueError("--prior-factor must be between 0 and 1")
 
     xml_path = resolve_input_path(args.xml)
     checkpoint_path = resolve_input_path(args.checkpoint)
@@ -652,15 +581,13 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     actor = load_actor(checkpoint_path)
-    normalize = load_normalizer(norm_path, actor.obs_dim)
+    normalize = load_normalizer(norm_path)
     env = Go2CpuEnv(
         xml_path,
         max_steps=args.max_steps,
         preset=args.preset,
         reset_noise=args.reset_noise,
         seed=args.seed,
-        actor_obs_dim=actor.obs_dim,
-        prior_factor=args.prior_factor,
     )
 
     state_lock = threading.Lock()
@@ -734,8 +661,7 @@ def main() -> None:
     )
     print(
         f"Limits: vx=+-{CMD_SCALE[0]:.2f}, vy=+-{CMD_SCALE[1]:.2f}, "
-        f"wz=+-{CMD_SCALE[2]:.2f}; control={CONTROL_HZ:.0f} Hz; device=CPU; "
-        f"actor_obs={actor.obs_dim}; prior={args.prior_factor:.2f}",
+        f"wz=+-{CMD_SCALE[2]:.2f}; control={CONTROL_HZ:.0f} Hz; device=CPU",
         flush=True,
     )
 

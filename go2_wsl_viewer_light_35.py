@@ -105,15 +105,13 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     actor = load_actor(checkpoint_path)
-    normalize = load_normalizer(norm_path, actor.obs_dim)
+    normalize = load_normalizer(norm_path)
     env = Go2CpuEnv(
         xml_path,
         max_steps=args.max_steps,
         preset=args.preset,
         reset_noise=args.reset_noise,
         seed=args.seed,
-        actor_obs_dim=actor.obs_dim,
-        prior_factor=args.prior_factor,
     )
 
     if not glfw.init():
@@ -273,8 +271,7 @@ def main() -> None:
     print(
         f"control={CONTROL_HZ:.0f} Hz  render={args.render_hz:g} fps  "
         f"window={args.width}x{args.height}  preset={args.preset}  "
-        f"torch_threads={args.torch_threads}  actor_obs={actor.obs_dim}  "
-        f"prior={args.prior_factor:.2f}",
+        f"torch_threads={args.torch_threads}",
         flush=True,
     )
 
