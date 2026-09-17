@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+MUJOCO_LOG.TXT
+*.log
+
+runs/
+videos*/
+*.mp4
+*.avi
+
+.DS_Store
+Thumbs.db
