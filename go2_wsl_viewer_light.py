@@ -30,6 +30,9 @@ from go2_wsl_viewer import (
     CMD_SCALE,
     CONTROL_HZ,
     MEM_DIM,
+    TERRAIN_LEVELS,
+    TERRAIN_TYPES,
+    TERRAIN_TYPE_NAMES,
     Go2CpuEnv,
     build_parser as build_base_parser,
     load_actor,
@@ -114,6 +117,9 @@ def main() -> None:
         seed=args.seed,
         actor_obs_dim=actor.obs_dim,
         prior_factor=args.prior_factor,
+        terrain_type=args.terrain_type,
+        terrain_level=args.terrain_level,
+        terrain_seed=args.terrain_seed,
     )
 
     if not glfw.init():
@@ -136,10 +142,19 @@ def main() -> None:
     context = mujoco.MjrContext(
         env.model, mujoco.mjtFontScale.mjFONTSCALE_100
     )
-    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-    camera.azimuth = 135.0
-    camera.elevation = -18.0
-    camera.distance = 2.1
+    camera_id = (
+        -1
+        if args.camera == "free"
+        else mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_CAMERA, args.camera)
+    )
+    if camera_id >= 0 and args.camera != "free":
+        camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
+        camera.fixedcamid = camera_id
+    else:
+        camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+        camera.azimuth = 90.0
+        camera.elevation = -12.0
+        camera.distance = 2.0
 
     state = {
         "command": np.clip(
@@ -148,16 +163,24 @@ def main() -> None:
         "changed": True,
         "reset": True,
         "paused": False,
+        "terrain_type": env.terrain_type,
+        "terrain_level": env.terrain_level,
     }
     mouse = {"x": 0.0, "y": 0.0, "left": False, "right": False}
 
     def update_title() -> None:
         command = state["command"]
         status = "PAUSED" if state["paused"] else "RUN"
+        terrain_name = (
+            TERRAIN_TYPE_NAMES[state["terrain_type"]]
+            if env.has_terrain
+            else "flat"
+        )
         glfw.set_window_title(
             window,
             f"Go2 {status} | vx {command[0]:+.2f}  vy {command[1]:+.2f}  "
-            f"wz {command[2]:+.2f} | control 50 Hz / render {args.render_hz:g} fps",
+            f"wz {command[2]:+.2f} | {terrain_name} "
+            f"L{state['terrain_level']} | 50 Hz / {args.render_hz:g} fps",
         )
 
     def print_command(prefix: str = "command") -> None:
@@ -167,6 +190,16 @@ def main() -> None:
             f"wz={command[2]:+.2f} rad/s",
             flush=True,
         )
+
+    def print_terrain() -> None:
+        if env.has_terrain:
+            terrain_name = TERRAIN_TYPE_NAMES[state["terrain_type"]]
+            print(
+                f"terrain: {terrain_name}  level={state['terrain_level']}",
+                flush=True,
+            )
+        else:
+            print("terrain: flat (terrain selection is unavailable)", flush=True)
 
     def key_callback(_window, key, _scancode, action, _mods) -> None:
         if action not in (glfw.PRESS, glfw.REPEAT):
@@ -203,6 +236,37 @@ def main() -> None:
             command[:] = (0.0, 0.0, -CMD_SCALE[2])
         elif key == glfw.KEY_R:
             state["reset"] = True
+            return
+        elif key == glfw.KEY_T:
+            if not env.has_terrain:
+                print_terrain()
+                return
+            state["terrain_type"] = (
+                state["terrain_type"] + 1
+            ) % TERRAIN_TYPES
+            state["reset"] = True
+            print_terrain()
+            update_title()
+            return
+        elif key == glfw.KEY_LEFT_BRACKET:
+            if not env.has_terrain:
+                print_terrain()
+                return
+            state["terrain_level"] = max(0, state["terrain_level"] - 1)
+            state["reset"] = True
+            print_terrain()
+            update_title()
+            return
+        elif key == glfw.KEY_RIGHT_BRACKET:
+            if not env.has_terrain:
+                print_terrain()
+                return
+            state["terrain_level"] = min(
+                TERRAIN_LEVELS - 1, state["terrain_level"] + 1
+            )
+            state["reset"] = True
+            print_terrain()
+            update_title()
             return
         elif key in (glfw.KEY_P, glfw.KEY_SPACE):
             if action == glfw.PRESS:
@@ -249,8 +313,9 @@ def main() -> None:
         width, height = glfw.get_framebuffer_size(window)
         if width <= 0 or height <= 0:
             return
-        # Follow the trunk while retaining user-controlled angle and zoom.
-        camera.lookat[:] = env.data.qpos[:3]
+        # Free camera follows manually; fixed side/track cameras use trackcom.
+        if camera.type == mujoco.mjtCamera.mjCAMERA_FREE:
+            camera.lookat[:] = env.data.qpos[:3]
         mujoco.mjv_updateScene(
             env.model,
             env.data,
@@ -267,16 +332,17 @@ def main() -> None:
 
     print(
         "Keys: W/S=vx  A/D=vy  Q/E=yaw  X=stop  1..6=presets  "
-        "R=reset  Space/P=pause  Esc=quit",
+        "T=terrain  [ / ]=level  R=reset  Space/P=pause  Esc=quit",
         flush=True,
     )
     print(
         f"control={CONTROL_HZ:.0f} Hz  render={args.render_hz:g} fps  "
         f"window={args.width}x{args.height}  preset={args.preset}  "
         f"torch_threads={args.torch_threads}  actor_obs={actor.obs_dim}  "
-        f"prior={args.prior_factor:.2f}",
+        f"prior={args.prior_factor:.2f}  camera={args.camera}",
         flush=True,
     )
+    print_terrain()
 
     command = state["command"].copy()
     observation = env.reset(command)
@@ -300,11 +366,13 @@ def main() -> None:
             now = time.perf_counter()
 
             if state["reset"]:
+                env.set_terrain(state["terrain_type"], state["terrain_level"])
                 observation = env.reset(state["command"])
                 membrane = torch.randn(1, MEM_DIM, dtype=torch.float32)
                 state["reset"] = False
                 state["changed"] = False
                 print_command("reset")
+                update_title()
             elif state["changed"]:
                 env.set_command(state["command"])
                 observation = env.observation()

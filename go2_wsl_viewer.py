@@ -11,6 +11,8 @@ Keys (focus the MuJoCo window first):
     Q/E  increase/decrease counter-clockwise yaw rate
     X    stop
     1..6 select full-speed direction presets
+    T    cycle through the five terrain types
+    [/]  decrease/increase terrain difficulty (0..9)
     R    reset the robot
     P or Space  pause/resume
     Esc  close the viewer
@@ -38,7 +40,7 @@ import torch.nn as nn
 
 
 # ---------------------------------------------------------------------------
-# Constants copied from go2_imitation_warp_release(1).ipynb
+# Constants copied from go2_imitation_warp_apex_terrain_fixed.ipynb
 
 CONTROL_HZ = 50.0
 CONTROL_DT = 1.0 / CONTROL_HZ
@@ -68,6 +70,26 @@ ENCODER_POP_DIM, DECODER_POP_DIM = 64, 256
 HIDDEN_SIZES = (256, 256, ACT_DIM * 2 * DECODER_POP_DIM)
 MEM_DIM = sum(HIDDEN_SIZES)
 NORM_CLIP_LIMIT = 50.0
+
+TERRAIN_LEVELS = 10
+TERRAIN_TYPES = 5
+TERRAIN_TYPE_NAMES = (
+    "smooth_slope",
+    "rough_slope",
+    "stairs_up",
+    "stairs_down",
+    "discrete",
+)
+TERRAIN_PATCH_SIZE = 8.0
+TERRAIN_GRID_RES = 0.10
+TERRAIN_GRID_N = int(round(TERRAIN_PATCH_SIZE / TERRAIN_GRID_RES)) + 1
+TERRAIN_X_CENTERS = np.linspace(
+    -0.5 * TERRAIN_PATCH_SIZE * (TERRAIN_LEVELS - 1),
+    0.5 * TERRAIN_PATCH_SIZE * (TERRAIN_LEVELS - 1),
+    TERRAIN_LEVELS,
+)
+TERRAIN_Y_CENTERS = np.linspace(-20.0, 20.0, TERRAIN_TYPES)
+TERRAIN_Z_MIN, TERRAIN_Z_RANGE = -1.5, 3.0
 
 LIF_BETA, LIF_THRESHOLD, SPIKE_SLOPE = 0.5, 1.0, 3.0
 ENC_VTH = 0.999
@@ -105,6 +127,110 @@ def standing_pose(height: float = H0) -> np.ndarray:
         leg_index = QPOS_ORDER.index(name)
         pose[3 * leg_index : 3 * leg_index + 3] = leg_ik(local, side)
     return pose
+
+
+def build_apex_terrain_bank(seed: int = 4321) -> np.ndarray:
+    """Build the five-by-ten terrain bank used by the training notebook."""
+    rng = np.random.default_rng(seed)
+    axis = np.linspace(
+        -TERRAIN_PATCH_SIZE / 2,
+        TERRAIN_PATCH_SIZE / 2,
+        TERRAIN_GRID_N,
+    )
+    xx, yy = np.meshgrid(axis, axis)
+    bank = np.zeros(
+        (TERRAIN_LEVELS, TERRAIN_TYPES, TERRAIN_GRID_N, TERRAIN_GRID_N),
+        dtype=np.float32,
+    )
+
+    for level in range(TERRAIN_LEVELS):
+        difficulty = level / max(1, TERRAIN_LEVELS - 1)
+        run = np.sign(xx) * np.maximum(np.abs(xx) - 1.0, 0.0)
+
+        slope = 0.02 + 0.20 * difficulty
+        bank[level, 0] = slope * run
+
+        amplitude = 0.008 + 0.055 * difficulty
+        coarse = rng.uniform(-amplitude, amplitude, size=(11, 11)).astype(np.float32)
+        rough = np.repeat(np.repeat(coarse, 8, axis=0), 8, axis=1)[
+            :TERRAIN_GRID_N, :TERRAIN_GRID_N
+        ]
+        for _ in range(2):
+            rough = (
+                rough
+                + np.roll(rough, 1, 0)
+                + np.roll(rough, -1, 0)
+                + np.roll(rough, 1, 1)
+                + np.roll(rough, -1, 1)
+            ) / 5.0
+        bank[level, 1] = 0.65 * slope * run + rough
+
+        step_height = 0.015 + 0.085 * difficulty
+        stair = (
+            np.sign(xx)
+            * np.floor(np.maximum(np.abs(xx) - 1.0, 0.0) / 0.40)
+            * step_height
+        )
+        bank[level, 2] = stair
+        bank[level, 3] = -stair
+
+        obstacle = np.zeros_like(xx, dtype=np.float32)
+        obstacle_height = 0.02 + 0.13 * difficulty
+        for _ in range(12 + 2 * level):
+            center_x, center_y = rng.uniform(-3.5, 3.5, size=2)
+            if abs(center_x) < 1.25 and abs(center_y) < 1.25:
+                continue
+            size_x, size_y = rng.uniform(0.20, 0.65, size=2)
+            height = (
+                rng.uniform(0.35, 1.0)
+                * obstacle_height
+                * rng.choice([-0.45, 1.0], p=[0.2, 0.8])
+            )
+            mask = (np.abs(xx - center_x) < size_x) & (
+                np.abs(yy - center_y) < size_y
+            )
+            obstacle[mask] = height
+        bank[level, 4] = obstacle
+
+        spawn = (np.abs(xx) <= 1.0) & (np.abs(yy) <= 1.0)
+        bank[level, :, spawn] = 0.0
+
+    return np.clip(
+        bank,
+        TERRAIN_Z_MIN + 0.02,
+        TERRAIN_Z_MIN + TERRAIN_Z_RANGE - 0.02,
+    ).astype(np.float32)
+
+
+def install_terrain_bank(model: mujoco.MjModel, bank: np.ndarray) -> bool:
+    """Populate an APEX terrain XML; return False for an ordinary flat XML."""
+    terrain_ids = [
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, f"terrain_t{i}")
+        for i in range(TERRAIN_TYPES)
+    ]
+    if all(terrain_id < 0 for terrain_id in terrain_ids):
+        return False
+    if any(terrain_id < 0 for terrain_id in terrain_ids):
+        raise ValueError("Terrain XML must contain terrain_t0 through terrain_t4")
+
+    for terrain_type, terrain_id in enumerate(terrain_ids):
+        pieces = [
+            bank[level, terrain_type, :, :-1]
+            for level in range(TERRAIN_LEVELS - 1)
+        ]
+        pieces.append(bank[-1, terrain_type])
+        strip = np.concatenate(pieces, axis=1)
+        normalized = np.clip(
+            (strip - TERRAIN_Z_MIN) / TERRAIN_Z_RANGE, 0.0, 1.0
+        )
+        address = int(model.hfield_adr[terrain_id])
+        count = int(model.hfield_nrow[terrain_id] * model.hfield_ncol[terrain_id])
+        if normalized.size != count:
+            raise ValueError(
+                f"Terrain heightfield size mismatch: {normalized.shape} != {count}"
+            )
+        model.hfield_data[address : address + count] = normalized.reshape(-1)
+    return True
 
 
 class BatchTrot:
@@ -262,8 +388,13 @@ class Go2CpuEnv:
         seed: int = 0,
         actor_obs_dim: int = BASE_OBS_DIM,
         prior_factor: float = 0.0,
+        terrain_type: str = TERRAIN_TYPE_NAMES[0],
+        terrain_level: int = 0,
+        terrain_seed: int = 4321,
     ):
         self.model = mujoco.MjModel.from_xml_path(str(xml_path))
+        self.terrain_bank = build_apex_terrain_bank(terrain_seed)
+        self.has_terrain = install_terrain_bank(self.model, self.terrain_bank)
         self.data = mujoco.MjData(self.model)
         self.max_steps = max_steps
         self.reset_noise = reset_noise
@@ -277,6 +408,10 @@ class Go2CpuEnv:
             raise ValueError("prior_factor must be between 0 and 1")
         self.actor_obs_dim = actor_obs_dim
         self.prior_factor = float(prior_factor)
+        self.terrain_type = 0
+        self.terrain_level = 0
+        if self.has_terrain:
+            self.set_terrain(terrain_type, terrain_level)
 
         if self.model.nu != ACT_DIM:
             raise ValueError(f"Expected {ACT_DIM} actuators, found {self.model.nu}")
@@ -334,6 +469,60 @@ class Go2CpuEnv:
             raise ValueError(f"Required sensor not found in XML: {name}")
         return int(self.model.sensor_adr[sensor_id])
 
+    @property
+    def terrain_name(self) -> str:
+        if not self.has_terrain:
+            return "flat"
+        return TERRAIN_TYPE_NAMES[self.terrain_type]
+
+    def set_terrain(self, terrain_type: str | int, terrain_level: int) -> None:
+        if not self.has_terrain:
+            return
+        if isinstance(terrain_type, str):
+            try:
+                terrain_index = TERRAIN_TYPE_NAMES.index(terrain_type)
+            except ValueError as error:
+                raise ValueError(f"Unknown terrain type: {terrain_type}") from error
+        else:
+            terrain_index = int(terrain_type)
+        if not 0 <= terrain_index < TERRAIN_TYPES:
+            raise ValueError(f"terrain type must be between 0 and {TERRAIN_TYPES - 1}")
+        if not 0 <= int(terrain_level) < TERRAIN_LEVELS:
+            raise ValueError(f"terrain level must be between 0 and {TERRAIN_LEVELS - 1}")
+        self.terrain_type = terrain_index
+        self.terrain_level = int(terrain_level)
+
+    def _terrain_origin(self) -> np.ndarray:
+        if not self.has_terrain:
+            return np.zeros(2, dtype=np.float64)
+        return np.asarray(
+            [
+                TERRAIN_X_CENTERS[self.terrain_level],
+                TERRAIN_Y_CENTERS[self.terrain_type],
+            ],
+            dtype=np.float64,
+        )
+
+    def _ground_height(self) -> float:
+        if not self.has_terrain:
+            return 0.0
+        local = self.data.qpos[:2] - self._terrain_origin()
+        ix = int(
+            np.clip(
+                np.rint((local[0] + TERRAIN_PATCH_SIZE / 2) / TERRAIN_GRID_RES),
+                0,
+                TERRAIN_GRID_N - 1,
+            )
+        )
+        iy = int(
+            np.clip(
+                np.rint((local[1] + TERRAIN_PATCH_SIZE / 2) / TERRAIN_GRID_RES),
+                0,
+                TERRAIN_GRID_N - 1,
+            )
+        )
+        return float(self.terrain_bank[self.terrain_level, self.terrain_type, iy, ix])
+
     def set_command(self, command: np.ndarray) -> None:
         command = np.asarray(command, dtype=np.float32).reshape(3).copy()
         np.clip(command, -CMD_SCALE, CMD_SCALE, out=command)
@@ -357,6 +546,8 @@ class Go2CpuEnv:
         swing_tensor = torch.tensor([self.swing_height], dtype=torch.float64)
         qpos = self.trot.qpos_at(command_tensor, time_tensor, swing_tensor)[0].numpy()
         qvel = self.trot.qvel_at(command_tensor, time_tensor, swing_tensor)[0].numpy()
+        qpos[:2] = self._terrain_origin()
+        qpos[2] = H0
         if self.reset_noise > 0:
             qpos[7:] += self.rng.uniform(-self.reset_noise, self.reset_noise, 12)
 
@@ -417,8 +608,9 @@ class Go2CpuEnv:
             mujoco.mj_step(self.model, self.data)
 
         self.step_count += 1
+        relative_height = self.data.qpos[2] - self._ground_height()
         fallen = bool(
-            self.data.qpos[2] < 0.23
+            relative_height < 0.23
             or np.hypot(self.data.qpos[4], self.data.qpos[5]) > 0.25
         )
         timeout = self.max_steps > 0 and self.step_count >= self.max_steps
@@ -579,7 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the trained Go2 policy at 50 Hz in a WSLg MuJoCo window"
     )
-    parser.add_argument("--xml", default="scene_flat.xml")
+    parser.add_argument("--xml", default="scene_apex_curriculum.xml")
     parser.add_argument(
         "--checkpoint", default="params_imit_warp_0/model_imit_10Kit.pt"
     )
@@ -596,6 +788,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="reset after this many control steps; 0 disables timeout resets",
     )
     parser.add_argument("--reset-noise", type=float, default=0.0)
+    parser.add_argument(
+        "--terrain-type",
+        choices=TERRAIN_TYPE_NAMES,
+        default=TERRAIN_TYPE_NAMES[0],
+    )
+    parser.add_argument(
+        "--terrain-level",
+        type=int,
+        choices=range(TERRAIN_LEVELS),
+        default=0,
+        metavar="0..9",
+    )
+    parser.add_argument("--terrain-seed", type=int, default=4321)
+    parser.add_argument(
+        "--camera",
+        choices=("side", "track", "free"),
+        default="side",
+        help="side and track cameras follow the robot",
+    )
     parser.add_argument(
         "--prior-factor",
         type=float,
@@ -661,6 +872,9 @@ def main() -> None:
         seed=args.seed,
         actor_obs_dim=actor.obs_dim,
         prior_factor=args.prior_factor,
+        terrain_type=args.terrain_type,
+        terrain_level=args.terrain_level,
+        terrain_seed=args.terrain_seed,
     )
 
     state_lock = threading.Lock()
@@ -671,6 +885,8 @@ def main() -> None:
         "changed": True,
         "reset": True,
         "paused": False,
+        "terrain_type": env.terrain_type,
+        "terrain_level": env.terrain_level,
     }
 
     def print_command(prefix: str = "command") -> None:
@@ -680,6 +896,16 @@ def main() -> None:
             f"wz={command[2]:+.2f} rad/s",
             flush=True,
         )
+
+    def print_terrain() -> None:
+        if env.has_terrain:
+            terrain_name = TERRAIN_TYPE_NAMES[state["terrain_type"]]
+            print(
+                f"terrain: {terrain_name}  level={state['terrain_level']}",
+                flush=True,
+            )
+        else:
+            print("terrain: flat (terrain selection is unavailable)", flush=True)
 
     def key_callback(keycode: int) -> None:
         try:
@@ -717,6 +943,34 @@ def main() -> None:
             elif key == "R":
                 state["reset"] = True
                 return
+            elif key == "T":
+                if not env.has_terrain:
+                    print_terrain()
+                    return
+                state["terrain_type"] = (
+                    state["terrain_type"] + 1
+                ) % TERRAIN_TYPES
+                state["reset"] = True
+                print_terrain()
+                return
+            elif key == "[":
+                if not env.has_terrain:
+                    print_terrain()
+                    return
+                state["terrain_level"] = max(0, state["terrain_level"] - 1)
+                state["reset"] = True
+                print_terrain()
+                return
+            elif key == "]":
+                if not env.has_terrain:
+                    print_terrain()
+                    return
+                state["terrain_level"] = min(
+                    TERRAIN_LEVELS - 1, state["terrain_level"] + 1
+                )
+                state["reset"] = True
+                print_terrain()
+                return
             elif key in ("P", " "):
                 state["paused"] = not state["paused"]
                 print("paused" if state["paused"] else "running", flush=True)
@@ -729,9 +983,11 @@ def main() -> None:
 
     print(
         "Keys: W/S=vx  A/D=vy  Q/E=yaw  X=stop  "
-        "1..6=direction presets  R=reset  Space/P=pause  Esc=quit",
+        "1..6=direction presets  T=terrain  [ / ]=level  "
+        "R=reset  Space/P=pause  Esc=quit",
         flush=True,
     )
+    print_terrain()
     print(
         f"Limits: vx=+-{CMD_SCALE[0]:.2f}, vy=+-{CMD_SCALE[1]:.2f}, "
         f"wz=+-{CMD_SCALE[2]:.2f}; control={CONTROL_HZ:.0f} Hz; device=CPU; "
@@ -750,10 +1006,14 @@ def main() -> None:
         show_left_ui=True,
         show_right_ui=True,
     ) as viewer:
-        camera_id = mujoco.mj_name2id(
-            env.model, mujoco.mjtObj.mjOBJ_CAMERA, "track"
+        camera_id = (
+            -1
+            if args.camera == "free"
+            else mujoco.mj_name2id(
+                env.model, mujoco.mjtObj.mjOBJ_CAMERA, args.camera
+            )
         )
-        if camera_id >= 0:
+        if camera_id >= 0 and args.camera != "free":
             with viewer.lock():
                 viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
                 viewer.cam.fixedcamid = camera_id
@@ -773,6 +1033,9 @@ def main() -> None:
 
             if reset:
                 with viewer.lock():
+                    env.set_terrain(
+                        state["terrain_type"], state["terrain_level"]
+                    )
                     observation = env.reset(command)
                 membrane = torch.randn(1, MEM_DIM, dtype=torch.float32)
                 print_command("reset")

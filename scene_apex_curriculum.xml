@@ -1,9 +1,5 @@
 <mujoco model="go2 apex-style curriculum terrain">
-  <!--
-    Five procedural heightfield strips are populated by the accompanying notebook.
-    Each strip contains ten 8 m x 8 m difficulty patches arranged along X.
-    Keep this file beside go2.xml and the assets/ directory.
-  -->
+  <!-- Five terrain strips, each containing ten difficulty patches along X. -->
   <include file="go2.xml"/>
 
   <statistic center="0 0 0.2" extent="45"/>
@@ -23,7 +19,6 @@
     <material name="terrain_mat" texture="terrain_tex" texuniform="true"
               texrepeat="20 2" reflectance="0.05"/>
 
-    <!-- nrow is the 8 m lateral direction; ncol is ten 8 m patches along X. -->
     <hfield name="terrain_t0" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
     <hfield name="terrain_t1" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
     <hfield name="terrain_t2" nrow="81" ncol="801" size="40 4 3.0 0.30"/>
@@ -33,8 +28,6 @@
 
   <worldbody>
     <light pos="0 0 8" dir="0 0 -1" directional="true"/>
-
-    <!-- The five strips use different friction values to provide friction diversity. -->
     <geom name="terrain_geom_t0" type="hfield" hfield="terrain_t0" pos="0 -20 -1.5"
           material="terrain_mat" friction="0.35 0.02 0.01" condim="3"/>
     <geom name="terrain_geom_t1" type="hfield" hfield="terrain_t1" pos="0 -10 -1.5"
@@ -46,12 +39,14 @@
     <geom name="terrain_geom_t4" type="hfield" hfield="terrain_t4" pos="0 20 -1.5"
           material="terrain_mat" friction="1.25 0.02 0.01" condim="3"/>
 
-    <!-- A low catch floor prevents an unrecoverable free fall outside a strip. -->
     <geom name="catch_floor" type="plane" pos="0 0 -1.82" size="0 0 0.05"
           rgba="0.08 0.10 0.08 1" friction="0.8 0.02 0.01" condim="3"/>
 
-    <camera name="track" mode="trackcom" pos="0 -2.3 0.75" xyaxes="1 0 0 0 0.24 1"/>
-    <camera name="side" mode="trackcom" pos="0 -2.0 0.30" xyaxes="1 0 0 0 0 1"/>
-    <camera name="overview" pos="43 -31 28" xyaxes="0.58 0.81 0 -0.36 0.26 0.90"/>
+    <camera name="track" mode="trackcom" pos="0 -2.3 0.75"
+            xyaxes="1 0 0 0 0.24 1"/>
+    <camera name="side" mode="trackcom" pos="0 -2.0 0.30"
+            xyaxes="1 0 0 0 0 1"/>
+    <camera name="overview" pos="43 -31 28"
+            xyaxes="0.58 0.81 0 -0.36 0.26 0.90"/>
   </worldbody>
 </mujoco>
