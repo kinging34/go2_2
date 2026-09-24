@@ -1,0 +1,234 @@
+{
+  "fixed": {
+    "source": "/workspace/easy-docker-jupyterhub/unitree_mujoco/unitree_robots/go2_2/runs/go2_snn_apex_stable_fixed_20260924_064726_2",
+    "max_logged_transitions": 20889600,
+    "metrics": {
+      "train/episode_total": {
+        "last": 31.084611892700195,
+        "step": 20889600,
+        "best": 49.067787170410156
+      },
+      "train/episode_style": {
+        "last": 5.732956409454346,
+        "step": 20889600,
+        "best": 26.13508415222168
+      },
+      "train/episode_task": {
+        "last": 25.351648330688477,
+        "step": 20889600,
+        "best": 25.391075134277344
+      },
+      "train/episode_length": {
+        "last": 500.0,
+        "step": 20889600,
+        "best": 500.0
+      },
+      "test/min_survival": {
+        "last": 1.0,
+        "step": 20889600,
+        "best": 1.0
+      },
+      "test/min_tracking": {
+        "last": 0.0,
+        "step": 20889600,
+        "best": 0.0
+      },
+      "policy/max_kl": {
+        "last": 0.04868616908788681,
+        "step": 20889600,
+        "best": 0.04868616908788681
+      },
+      "policy/rejected_kl": {
+        "last": 0.04868616908788681,
+        "step": 20889600,
+        "best": 0.04868616908788681
+      },
+      "policy/lr": {
+        "last": 9.999999974752427e-07,
+        "step": 20889600,
+        "best": 0.00011000000085914508
+      },
+      "train/decap_factor_last": {
+        "last": 0.016565442085266113,
+        "step": 20889600,
+        "best": 0.9976910948753357
+      },
+      "test/前進": {
+        "last": 25.0,
+        "step": 20889600,
+        "best": 25.100000381469727
+      },
+      "test/後退": {
+        "last": 25.700000762939453,
+        "step": 20889600,
+        "best": 25.799999237060547
+      },
+      "test/左移動": {
+        "last": 25.0,
+        "step": 20889600,
+        "best": 25.100000381469727
+      },
+      "test/左旋回": {
+        "last": 25.700000762939453,
+        "step": 20889600,
+        "best": 25.700000762939453
+      },
+      "test/前進_survival": {
+        "last": 1.0,
+        "step": 20889600,
+        "best": 1.0
+      },
+      "test/前進_tracking": {
+        "last": 0.0,
+        "step": 20889600,
+        "best": 0.0
+      },
+      "test/後退_survival": {
+        "last": 1.0,
+        "step": 20889600,
+        "best": 1.0
+      },
+      "test/後退_tracking": {
+        "last": 0.02537548542022705,
+        "step": 20889600,
+        "best": 0.0259244441986084
+      },
+      "test/左移動_survival": {
+        "last": 1.0,
+        "step": 20889600,
+        "best": 1.0
+      },
+      "test/左移動_tracking": {
+        "last": 0.0,
+        "step": 20889600,
+        "best": 0.0014846324920654297
+      },
+      "test/左旋回_survival": {
+        "last": 1.0,
+        "step": 20889600,
+        "best": 1.0
+      },
+      "test/左旋回_tracking": {
+        "last": 0.0,
+        "step": 20889600,
+        "best": 0.0013820528984069824
+      }
+    }
+  },
+  "adaptive": {
+    "source": "/workspace/easy-docker-jupyterhub/unitree_mujoco/unitree_robots/go2_2/runs/go2_snn_apex_adaptive_prior_20260924_064707_0",
+    "max_logged_transitions": 15974400,
+    "metrics": {
+      "train/episode_total": {
+        "last": 30.506086349487305,
+        "step": 15974400,
+        "best": 50.468505859375
+      },
+      "train/episode_style": {
+        "last": 8.63916015625,
+        "step": 15974400,
+        "best": 27.274856567382812
+      },
+      "train/episode_task": {
+        "last": 21.866924285888672,
+        "step": 15974400,
+        "best": 23.193689346313477
+      },
+      "train/episode_length": {
+        "last": 500.0,
+        "step": 15974400,
+        "best": 500.0
+      },
+      "test/min_survival": {
+        "last": 1.0,
+        "step": 15974400,
+        "best": 1.0
+      },
+      "test/min_tracking": {
+        "last": 0.0,
+        "step": 15974400,
+        "best": 0.0
+      },
+      "policy/max_kl": {
+        "last": 0.018023882061243057,
+        "step": 15974400,
+        "best": 0.024956591427326202
+      },
+      "policy/rejected_kl": {
+        "last": 0.0,
+        "step": 15974400,
+        "best": 0.0
+      },
+      "policy/lr": {
+        "last": 9.999999974752427e-07,
+        "step": 15974400,
+        "best": 0.00011000000085914508
+      },
+      "train/decap_factor_last": {
+        "last": 0.5133420825004578,
+        "step": 15974400,
+        "best": 1.0
+      },
+      "test/前進": {
+        "last": 25.0,
+        "step": 15974400,
+        "best": 25.100000381469727
+      },
+      "test/後退": {
+        "last": 25.700000762939453,
+        "step": 15974400,
+        "best": 25.799999237060547
+      },
+      "test/左移動": {
+        "last": 25.0,
+        "step": 15974400,
+        "best": 25.100000381469727
+      },
+      "test/左旋回": {
+        "last": 25.700000762939453,
+        "step": 15974400,
+        "best": 25.700000762939453
+      },
+      "test/前進_survival": {
+        "last": 1.0,
+        "step": 15974400,
+        "best": 1.0
+      },
+      "test/前進_tracking": {
+        "last": 0.0,
+        "step": 15974400,
+        "best": 0.0
+      },
+      "test/後退_survival": {
+        "last": 1.0,
+        "step": 15974400,
+        "best": 1.0
+      },
+      "test/後退_tracking": {
+        "last": 0.02512115240097046,
+        "step": 15974400,
+        "best": 0.025918960571289062
+      },
+      "test/左移動_survival": {
+        "last": 1.0,
+        "step": 15974400,
+        "best": 1.0
+      },
+      "test/左移動_tracking": {
+        "last": 0.0,
+        "step": 15974400,
+        "best": 0.001511991024017334
+      },
+      "test/左旋回_survival": {
+        "last": 1.0,
+        "step": 15974400,
+        "best": 1.0
+      },
+      "test/左旋回_tracking": {
+        "last": 0.0,
+        "step": 15974400,
+        "best": 0.0013843178749084473
+      }
+    }
+  }
+}
