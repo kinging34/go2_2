@@ -1,0 +1,6 @@
+mujoco-warp==3.14.0
+pandas
+pyyaml
+wandb
+tensorboard
+jupyterlab
