@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-"""WSL/WSLg用 Go2 SNN キーボードビューア (新45次元APEX版).
+"""WSL/WSLg用 Go2 SNN APEX v5 キーボードビューア (47次元・膜電位モーターヘッド版).
 
 学習済みSNN Actorを単体で推論し、W/S/A/D/Q/Eで速度指令、1〜4で地形を切り替える。
 Action Prior / Critic / PPOは推論時には使用しない。
+
+v5対応点:
+  - 45D APEX観測 + 歩容phase sin/cos = 47D
+  - SNN第1/第2層の膜電位をLayerNormして連続モーターヘッドへ入力
+  - 最終spike-rate decoderを小さい残差として加算
+  - 学習時と同じ APEX PD (Kp=20, Kd=0.5), action scale=0.25, torque limit
+
+注意:
+  v5のcheckpointからLayerNorm/continuous headを形状とキー名で自動検出します。
+  構造を特定できない場合は、推測して動かさず診断を表示して停止します。
 
 必要ファイル:
   - scene_flat.xml と、そのXMLから参照されるmesh/texture等
@@ -30,6 +40,7 @@ import numpy as np
 from PIL import Image
 import torch
 from torch import nn
+import torch.nn.functional as F
 import glfw
 import mujoco
 
@@ -40,11 +51,11 @@ WORK_DIR = Path(__file__).resolve().parent
 FLAT_SCENE = WORK_DIR / "scene_flat.xml"
 
 # 手動指定する場合はPathを入れる。Noneならparams_*から入力次元を見て自動探索。
-PARAMS_DIR = "params_09-24_APEX"
+PARAMS_DIR = "params_09-24_APEX_6"
 ACTOR_CHECKPOINT = None
 NORM_CHECKPOINT = None
 
-EXPECTED_OBS_DIM = 45
+EXPECTED_OBS_DIM = 47
 START_TERRAIN = "easy"  # flat / easy / medium / hard
 TORCH_DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -57,9 +68,21 @@ REPORT_INTERVAL = 5.0
 
 # 学習時と同じ制御定数
 H0 = 0.33
-CMD_LIMIT = np.array([0.60, 0.30, 1.00], dtype=np.float32)
-ACT_SCALE = np.asarray([0.5, 0.8, 0.8] * 4, dtype=np.float64)
-SERVO_KP, SERVO_KD = 60.0, 2.0
+CMD_LIMIT = np.array([0.60, 0.60, 1.00], dtype=np.float32)
+ACT_SCALE = np.full(12, 0.25, dtype=np.float64)
+SERVO_KP, SERVO_KD = 20.0, 0.5
+ACTION_CLIP = 100.0
+FALLBACK_TORQUE_LIMIT = np.asarray([23.7, 23.7, 45.43] * 4, dtype=np.float64)
+
+# v5でActorへ追加した歩容phase。学習Notebookの T_GAIT=0.40 s と20 ms制御に合わせる。
+T_GAIT = 0.40
+GAIT_CONTROL_DT = 0.02
+GAIT_CYCLE_STEPS = int(round(T_GAIT / GAIT_CONTROL_DT))
+
+# v5の「最終spike-rate出力を小さい残差として残す」の既定値。
+# checkpoint/full checkpoint内に対応するscalar/configがあればそちらを優先する。
+DEFAULT_SPIKE_RESIDUAL_SCALE = 0.10
+DEFAULT_ACTION_MEAN_CLIP = 4.0
 PERM = np.array([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8])
 
 # キー1回あたりの指令変化量
@@ -73,7 +96,7 @@ LIF_THRESHOLD = 1.0
 SPIKE_SLOPE = 3.0
 ENC_VTH = 0.999
 
-# 45D APEX Actorの観測scale
+# 47D v5 Actorのうち先頭45Dに使うAPEX観測scale
 APEX_CMD_OBS_SCALE = np.array([2.0, 2.0, 0.25], dtype=np.float32)
 
 # Go2脚形状（standing pose生成用）
@@ -92,7 +115,7 @@ except RuntimeError:
     pass
 
 print("作業フォルダ:", WORK_DIR.resolve())
-print("モデル種別:", "新45次元APEX版")
+print("モデル種別:", "APEX v5 47次元・膜電位モーターヘッド版")
 print("推論デバイス:", TORCH_DEVICE)
 print("DISPLAY:", os.environ.get("DISPLAY"), "/ WAYLAND_DISPLAY:", os.environ.get("WAYLAND_DISPLAY"))
 
@@ -197,66 +220,17 @@ for name, path in SCENES.items():
 
 
 # ============================================================
-# SNN Actor（PPO版Notebookと同じ deterministic population encoder）
+# SNN Actor v5
+# - deterministic population encoder
+# - LIF 3層
+# - mem1/mem2 -> LayerNorm -> continuous motor head
+# - spike-rate decoder is a small residual
 # ============================================================
 def lif_step(current, previous, beta=LIF_BETA, threshold=LIF_THRESHOLD):
     reset = (previous > threshold).to(previous.dtype)
     membrane = beta * previous + current - reset * threshold
     spike = (membrane - threshold > 0).to(membrane.dtype)
     return spike, membrane
-
-
-class Encoder(nn.Module):
-    def __init__(self, obs_dim, pop_dim):
-        super().__init__()
-        self.obs_dim = obs_dim
-        self.pop_dim = pop_dim
-        self.weight = nn.Parameter(torch.ones(1, obs_dim))
-        self.bias = nn.Parameter(torch.zeros(1, obs_dim))
-        self.register_buffer("zeros", torch.zeros(1, obs_dim * 2))
-        u = (torch.arange(pop_dim, dtype=torch.float32) + 0.5) / pop_dim
-        self.register_buffer("fixed_u", u.view(1, 1, pop_dim))
-
-    def forward(self, obs):
-        obs = torch.tanh(obs * self.weight + self.bias)
-        probability = torch.maximum(torch.cat([obs, -obs], dim=1), self.zeros)
-        u = self.fixed_u.expand(probability.shape[0], probability.shape[1], self.pop_dim)
-        voltage = probability.unsqueeze(-1) + u
-        return voltage.gt(ENC_VTH).to(probability.dtype).reshape(probability.shape[0], -1)
-
-
-class Decoder(nn.Module):
-    def __init__(self, act_dim, pop_dim):
-        super().__init__()
-        self.act_dim = act_dim
-        self.pop_dim = pop_dim
-        self.register_buffer("weight", torch.ones(1, act_dim))
-        self.register_buffer("bias", torch.zeros(1, act_dim))
-
-    def forward(self, spikes):
-        rates = spikes.reshape(-1, self.act_dim * 2, self.pop_dim).mean(-1)
-        return torch.tanh((rates[:, :self.act_dim] - rates[:, self.act_dim:]) * self.weight + self.bias)
-
-
-class ViewerSpikeActor(nn.Module):
-    def __init__(self, obs_dim, hidden1, hidden2, output_spikes, act_dim, enc_pop, dec_pop):
-        super().__init__()
-        self.Linear1 = nn.Linear(obs_dim * 2 * enc_pop, hidden1)
-        self.Linear2 = nn.Linear(hidden1, hidden2)
-        self.Linear3 = nn.Linear(hidden2, output_spikes)
-        self.encoder = Encoder(obs_dim, enc_pop)
-        self.decoder = Decoder(act_dim, dec_pop)
-        self.p1 = hidden1
-        self.p2 = hidden1 + hidden2
-        self.mem_dim = hidden1 + hidden2 + output_spikes
-        self.obs_dim = obs_dim
-        self.act_dim = act_dim
-
-    def forward(self, obs, membrane):
-        spike1, mem1 = lif_step(self.Linear1(self.encoder(obs)), membrane[:, :self.p1])
-        spike2, mem2 = lif_step(self.Linear2(spike1), membrane[:, self.p1:self.p2])
-        spike3, mem3 = lif_step(self.Linear3(spike2), membrane[:, self.p2:])
-        return self.decoder(spike3), torch.cat([mem1, mem2, mem3], dim=1)
 
 
 def torch_load(path):
@@ -267,72 +241,335 @@ def torch_load(path):
 
 
 def _strip_prefix(key):
-    for prefix in ("_orig_mod.", "module."):
-        if key.startswith(prefix):
-            key = key[len(prefix):]
+    # torch.compile / DDP由来のprefixを複数段許容する。
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("_orig_mod.", "module."):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
     return key
 
 
-def extract_actor_state(checkpoint):
-    """actor単体ptとfull checkpointの両方を許容する。"""
+def extract_actor_state_and_config(checkpoint):
+    """actor単体pt/full checkpointの両方からActor stateとconfigを取り出す。"""
     if not isinstance(checkpoint, dict):
         raise TypeError("checkpointが辞書形式ではありません")
+
+    config = checkpoint.get("config", {}) if isinstance(checkpoint.get("config", {}), dict) else {}
 
     if "policy" in checkpoint and isinstance(checkpoint["policy"], dict):
         raw = checkpoint["policy"]
         selected = {}
         for k, v in raw.items():
+            if not torch.is_tensor(v):
+                continue
             k = _strip_prefix(k)
             if k.startswith("san."):
                 selected[k[len("san."):]] = v
         if not selected:
             raise KeyError("full checkpointの policy 内に san.* が見つかりません")
-        return selected
+        return selected, config
 
+    actor_obj = checkpoint
     for nested_key in ("actor", "san", "state_dict"):
-        if nested_key in checkpoint and isinstance(checkpoint[nested_key], dict):
-            checkpoint = checkpoint[nested_key]
+        if nested_key in actor_obj and isinstance(actor_obj[nested_key], dict):
+            actor_obj = actor_obj[nested_key]
             break
 
     result = {}
-    for k, v in checkpoint.items():
+    for k, v in actor_obj.items():
         if not torch.is_tensor(v):
             continue
         k = _strip_prefix(k)
         if k.startswith("san."):
             k = k[len("san."):]
         if k.startswith("lif"):
+            # LIFがparameterを持たない版との互換。Tensorがあれば使わない。
             continue
         result[k] = v
-    return result
+    return result, config
 
 
 def infer_obs_dim_from_state(state):
     if "encoder.weight" not in state:
         raise KeyError("encoder.weight がcheckpointにありません")
-    return int(state["encoder.weight"].shape[1])
+    w = state["encoder.weight"]
+    if w.ndim != 2 or w.shape[0] != 1:
+        raise ValueError(f"encoder.weight shapeが想定外です: {tuple(w.shape)}")
+    return int(w.shape[1])
 
 
-def actor_from_state(state):
-    obs_dim = infer_obs_dim_from_state(state)
-    act_dim = int(state["decoder.weight"].shape[1])
-    hidden1, encoded = state["Linear1.weight"].shape
-    hidden2 = int(state["Linear2.weight"].shape[0])
-    output_spikes = int(state["Linear3.weight"].shape[0])
-    enc_pop = encoded // (obs_dim * 2)
-    dec_pop = output_spikes // (act_dim * 2)
+def _state_shapes(state):
+    return "\n".join(f"  {k:42s} {tuple(v.shape)}" for k, v in sorted(state.items()))
 
-    actor = ViewerSpikeActor(obs_dim, hidden1, hidden2, output_spikes,
-                             act_dim, enc_pop, dec_pop)
-    missing, unexpected = actor.load_state_dict(state, strict=False)
-    # 古い/別形式checkpointでfixed_uが無い場合を除き、重要parameterの欠損は拒否。
-    critical_missing = [k for k in missing if k not in ("encoder.zeros", "encoder.fixed_u")]
-    if critical_missing or unexpected:
-        raise RuntimeError(f"checkpointの構造が想定外です。missing={critical_missing}, unexpected={unexpected}")
-    actor.to(TORCH_DEVICE).eval()
-    for parameter in actor.parameters():
-        parameter.requires_grad_(False)
-    return actor
+
+def _find_layernorm_prefixes(state, hidden1, hidden2):
+    """v5のmembrane LayerNormをstate_dict形状から特定する。"""
+    items = []
+    for k, w in state.items():
+        if not k.endswith(".weight") or w.ndim != 1:
+            continue
+        prefix = k[:-len(".weight")]
+        bkey = prefix + ".bias"
+        if bkey not in state or state[bkey].shape != w.shape:
+            continue
+        low = prefix.lower()
+        if "encoder" in low or "decoder" in low:
+            continue
+        # LayerNormらしい名前を優先。Linear bias等はweightが2Dなのでここには来ない。
+        score = 0
+        if "norm" in low or ".ln" in low or low.startswith("ln"):
+            score += 20
+        if "mem" in low:
+            score += 10
+        if "motor" in low or "head" in low or "readout" in low:
+            score += 4
+        items.append((prefix, int(w.numel()), score))
+
+    # 連結後1個のLayerNormを使う実装にも対応。
+    concat = sorted([x for x in items if x[1] == hidden1 + hidden2], key=lambda x: x[2], reverse=True)
+    if concat:
+        return {"mode": "concat", "prefix": concat[0][0]}
+
+    same1 = [x for x in items if x[1] == hidden1]
+    same2 = [x for x in items if x[1] == hidden2]
+    if hidden1 == hidden2:
+        candidates = sorted(same1, key=lambda x: (x[2], x[0]), reverse=True)
+        if len(candidates) < 2:
+            raise RuntimeError("hidden1==hidden2ですが、membrane用LayerNormを2個特定できません")
+
+        def numeric_score(name, want):
+            low = name.lower()
+            score = 0
+            if f"norm{want}" in low or f"norm_{want}" in low or f"ln{want}" in low or f"ln_{want}" in low:
+                score += 100
+            if f"mem{want}" in low or f"mem_{want}" in low:
+                score += 80
+            return score
+
+        p1 = max(candidates, key=lambda x: numeric_score(x[0], 1) + x[2])[0]
+        remaining = [x for x in candidates if x[0] != p1]
+        p2 = max(remaining, key=lambda x: numeric_score(x[0], 2) + x[2])[0]
+        return {"mode": "separate", "prefix1": p1, "prefix2": p2}
+
+    if not same1 or not same2:
+        raise RuntimeError(
+            f"membrane LayerNormを特定できません (hidden1={hidden1}, hidden2={hidden2})"
+        )
+    p1 = max(same1, key=lambda x: x[2])[0]
+    p2 = max(same2, key=lambda x: x[2])[0]
+    return {"mode": "separate", "prefix1": p1, "prefix2": p2}
+
+
+def _find_motor_head_prefix(state, act_dim, hidden1, hidden2):
+    candidates = []
+    for k, w in state.items():
+        if not k.endswith(".weight") or w.ndim != 2 or int(w.shape[0]) != act_dim:
+            continue
+        prefix = k[:-len(".weight")]
+        low = prefix.lower()
+        if prefix in ("Linear1", "Linear2", "Linear3") or "decoder" in low:
+            continue
+        in_dim = int(w.shape[1])
+        if in_dim not in (hidden1, hidden2, hidden1 + hidden2):
+            continue
+        score = 0
+        if "motor" in low: score += 30
+        if "head" in low: score += 25
+        if "readout" in low: score += 20
+        if "continuous" in low: score += 15
+        if "action" in low: score += 10
+        if in_dim == hidden1 + hidden2: score += 8
+        if "critic" in low or "value" in low: score -= 100
+        candidates.append((score, prefix, in_dim))
+    if not candidates:
+        raise RuntimeError("12出力のcontinuous motor headを特定できません")
+    candidates.sort(reverse=True)
+    _, prefix, in_dim = candidates[0]
+    return prefix, in_dim
+
+
+def _decoder_kind(state):
+    if "decoder.log_gain" in state:
+        return "log_gain"
+    if "decoder.weight" in state:
+        return "weight"
+    # 最終spike residualを完全に廃止しているcheckpointならnoneも許容。
+    return "none"
+
+
+def _scalar_from_config_or_state(config, state, default):
+    config_keys = (
+        "spike_residual_scale", "snn_spike_residual_scale",
+        "motor_spike_residual_scale", "decoder_residual_scale",
+    )
+    for k in config_keys:
+        if k in config:
+            try:
+                return float(config[k]), f"config[{k}]"
+            except Exception:
+                pass
+    for k, v in state.items():
+        low = k.lower()
+        if ("resid" in low and "scale" in low) or ("spike" in low and "scale" in low):
+            if torch.is_tensor(v) and v.numel() == 1:
+                return float(v.reshape(-1)[0]), k
+    return float(default), "viewer default"
+
+
+def _action_clip_from_config(config):
+    for k in ("snn_action_mean_clip", "action_mean_clip", "actor_mean_clip"):
+        if k in config:
+            try:
+                return float(config[k]), f"config[{k}]"
+            except Exception:
+                pass
+    return float(DEFAULT_ACTION_MEAN_CLIP), "viewer default"
+
+
+class ViewerV5SpikeActor(nn.Module):
+    """checkpointのTensorをそのまま使うv5推論Actor。
+
+    module名を固定して再実装するとNotebook側の命名変更だけでロード不能になるため、
+    state_dictの形状からLayerNormとmotor headを特定してfunctionalに実行する。
+    """
+    def __init__(self, state, config):
+        super().__init__()
+        self.obs_dim = infer_obs_dim_from_state(state)
+        self.act_dim = 12
+
+        required = (
+            "Linear1.weight", "Linear1.bias", "Linear2.weight", "Linear2.bias",
+            "Linear3.weight", "Linear3.bias", "encoder.weight", "encoder.bias",
+        )
+        missing = [k for k in required if k not in state]
+        if missing:
+            raise KeyError(f"v5 Actorの必須キーがありません: {missing}\nstate_dict:\n{_state_shapes(state)}")
+
+        h1, encoded = state["Linear1.weight"].shape
+        h2 = int(state["Linear2.weight"].shape[0])
+        out_spikes = int(state["Linear3.weight"].shape[0])
+        if encoded % (self.obs_dim * 2) != 0:
+            raise ValueError("Linear1入力次元からencoder population数を復元できません")
+        self.enc_pop = int(encoded // (self.obs_dim * 2))
+        if out_spikes % (self.act_dim * 2) != 0:
+            raise ValueError("Linear3出力次元からdecoder population数を復元できません")
+        self.dec_pop = int(out_spikes // (self.act_dim * 2))
+        self.h1, self.h2, self.out_spikes = int(h1), int(h2), out_spikes
+        self.p1 = self.h1
+        self.p2 = self.h1 + self.h2
+        self.mem_dim = self.h1 + self.h2 + self.out_spikes
+
+        norm_info = _find_layernorm_prefixes(state, self.h1, self.h2)
+        head_prefix, head_in = _find_motor_head_prefix(state, self.act_dim, self.h1, self.h2)
+        self.norm_info = norm_info
+        self.head_prefix = head_prefix
+        self.head_in = head_in
+        self.decoder_kind = _decoder_kind(state)
+        self.residual_scale, self.residual_scale_source = _scalar_from_config_or_state(
+            config, state, DEFAULT_SPIKE_RESIDUAL_SCALE
+        )
+        self.action_mean_clip, self.action_clip_source = _action_clip_from_config(config)
+
+        # 使用Tensorをbufferとして保持する。
+        for name, key in (
+            ("W1", "Linear1.weight"), ("b1", "Linear1.bias"),
+            ("W2", "Linear2.weight"), ("b2", "Linear2.bias"),
+            ("W3", "Linear3.weight"), ("b3", "Linear3.bias"),
+            ("enc_weight", "encoder.weight"), ("enc_bias", "encoder.bias"),
+            ("head_weight", head_prefix + ".weight"),
+        ):
+            self.register_buffer(name, state[key].detach().float().clone())
+        h_bias_key = head_prefix + ".bias"
+        hb = state[h_bias_key] if h_bias_key in state else torch.zeros(self.act_dim)
+        self.register_buffer("head_bias", hb.detach().float().clone())
+
+        if norm_info["mode"] == "concat":
+            p = norm_info["prefix"]
+            self.register_buffer("norm_weight", state[p + ".weight"].detach().float().clone())
+            self.register_buffer("norm_bias", state[p + ".bias"].detach().float().clone())
+        else:
+            p1, p2 = norm_info["prefix1"], norm_info["prefix2"]
+            self.register_buffer("norm1_weight", state[p1 + ".weight"].detach().float().clone())
+            self.register_buffer("norm1_bias", state[p1 + ".bias"].detach().float().clone())
+            self.register_buffer("norm2_weight", state[p2 + ".weight"].detach().float().clone())
+            self.register_buffer("norm2_bias", state[p2 + ".bias"].detach().float().clone())
+
+        if self.decoder_kind == "log_gain":
+            self.register_buffer("dec_log_gain", state["decoder.log_gain"].detach().float().clone())
+            db = state.get("decoder.bias", torch.zeros(1, self.act_dim))
+            self.register_buffer("dec_bias", db.detach().float().clone())
+        elif self.decoder_kind == "weight":
+            self.register_buffer("dec_weight", state["decoder.weight"].detach().float().clone())
+            db = state.get("decoder.bias", torch.zeros(1, self.act_dim))
+            self.register_buffer("dec_bias", db.detach().float().clone())
+
+        # deterministic population threshold
+        u = (torch.arange(self.enc_pop, dtype=torch.float32) + 0.5) / self.enc_pop
+        self.register_buffer("fixed_u", u.view(1, 1, self.enc_pop))
+        self.register_buffer("enc_zeros", torch.zeros(1, self.obs_dim * 2))
+
+    def _encode(self, obs):
+        x = torch.tanh(obs * self.enc_weight + self.enc_bias)
+        p = torch.maximum(torch.cat([x, -x], dim=1), self.enc_zeros)
+        u = self.fixed_u.expand(p.shape[0], p.shape[1], self.enc_pop)
+        voltage = p.unsqueeze(-1) + u
+        return voltage.gt(ENC_VTH).to(p.dtype).reshape(p.shape[0], -1)
+
+    def _spike_decoder(self, spk3):
+        if self.decoder_kind == "none":
+            return torch.zeros(spk3.shape[0], self.act_dim, device=spk3.device, dtype=spk3.dtype)
+        s = spk3.reshape(-1, self.act_dim * 2, self.dec_pop).mean(-1)
+        signed = s[:, :self.act_dim] - s[:, self.act_dim:]
+        if self.decoder_kind == "log_gain":
+            gain = torch.exp(self.dec_log_gain).clamp(0.5, 4.0)
+            return torch.clamp(signed * gain + self.dec_bias, -4.0, 4.0)
+        # 旧decoder互換: tanh((positive-negative)*weight + bias)
+        return torch.tanh(signed * self.dec_weight + self.dec_bias)
+
+    def _motor_features(self, mem1, mem2):
+        if self.norm_info["mode"] == "concat":
+            cat = torch.cat([mem1, mem2], dim=1)
+            normed = F.layer_norm(cat, (cat.shape[1],), self.norm_weight, self.norm_bias, 1e-5)
+            if self.head_in != normed.shape[1]:
+                raise RuntimeError("motor head入力次元とconcat LayerNorm出力次元が一致しません")
+            return normed
+
+        n1 = F.layer_norm(mem1, (self.h1,), self.norm1_weight, self.norm1_bias, 1e-5)
+        n2 = F.layer_norm(mem2, (self.h2,), self.norm2_weight, self.norm2_bias, 1e-5)
+        if self.head_in == self.h1 + self.h2:
+            return torch.cat([n1, n2], dim=1)
+        if self.head_in == self.h1:
+            return n1
+        if self.head_in == self.h2:
+            return n2
+        raise RuntimeError(f"未対応motor head入力次元: {self.head_in}")
+
+    def forward(self, obs, membrane):
+        spk1, mem1 = lif_step(F.linear(self._encode(obs), self.W1, self.b1), membrane[:, :self.p1])
+        spk2, mem2 = lif_step(F.linear(spk1, self.W2, self.b2), membrane[:, self.p1:self.p2])
+        spk3, mem3 = lif_step(F.linear(spk2, self.W3, self.b3), membrane[:, self.p2:])
+
+        motor = F.linear(self._motor_features(mem1, mem2), self.head_weight, self.head_bias)
+        spike_residual = self._spike_decoder(spk3)
+        action = motor + self.residual_scale * spike_residual
+        action = torch.clamp(action, -self.action_mean_clip, self.action_mean_clip)
+        mem_out = torch.cat([mem1, mem2, mem3], dim=1)
+        return action, mem_out
+
+    def describe(self):
+        if self.norm_info["mode"] == "concat":
+            norm_text = self.norm_info["prefix"]
+        else:
+            norm_text = f"{self.norm_info['prefix1']} + {self.norm_info['prefix2']}"
+        print(f"v5 Actor: obs={self.obs_dim}, action={self.act_dim}, mem={self.mem_dim}")
+        print(f"  hidden=({self.h1}, {self.h2}, {self.out_spikes}), enc_pop={self.enc_pop}, dec_pop={self.dec_pop}")
+        print(f"  membrane norm: {norm_text}")
+        print(f"  motor head   : {self.head_prefix} (in={self.head_in} -> 12)")
+        print(f"  spike decoder: {self.decoder_kind}, residual_scale={self.residual_scale:g} ({self.residual_scale_source})")
+        print(f"  mean clip    : ±{self.action_mean_clip:g} ({self.action_clip_source})")
 
 
 def numeric_suffix(path):
@@ -347,32 +584,38 @@ def candidate_param_dirs():
             p = WORK_DIR / p
         return [p]
     dirs = [p for p in WORK_DIR.glob("params_*") if p.is_dir()]
-    # 45Dはparams_*_APEXを優先する。
-    return sorted(dirs, key=lambda p: (1 if p.name.endswith("_APEX") else 0, p.stat().st_mtime), reverse=True)
+    return sorted(dirs, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def find_actor_checkpoint():
     if ACTOR_CHECKPOINT is not None:
         p = Path(ACTOR_CHECKPOINT)
-        return p if p.is_absolute() else WORK_DIR / p
+        p = p if p.is_absolute() else WORK_DIR / p
+        if not p.is_file():
+            raise FileNotFoundError(f"ACTOR_CHECKPOINTがありません: {p}")
+        return p
 
     checked = []
     for folder in candidate_param_dirs():
-        # actor単体を優先。fullも手動指定なら読める。
-        candidates = sorted(folder.glob("*_actor_*Kit.pt"),
-                            key=lambda p: (numeric_suffix(p), p.stat().st_mtime), reverse=True)
+        patterns = ("*_actor_*Kit.pt", "*_actor_*.pt", "*_full_*Kit.pt", "*_full_*.pt")
+        candidates = []
+        for pat in patterns:
+            candidates.extend(folder.glob(pat))
+        candidates = sorted(set(candidates), key=lambda p: (numeric_suffix(p), p.stat().st_mtime), reverse=True)
         for p in candidates:
             try:
-                state = extract_actor_state(torch_load(p))
+                state, _ = extract_actor_state_and_config(torch_load(p))
                 dim = infer_obs_dim_from_state(state)
                 checked.append((p, dim))
                 if dim == EXPECTED_OBS_DIM:
+                    # v5構造まで事前検査する。45D等を誤ロードしない。
+                    ViewerV5SpikeActor(state, {}).describe()
                     return p
             except Exception as exc:
                 print(f"checkpoint候補をスキップ: {p.name}: {exc}")
-    details = "\n".join(f"  {p} -> obs_dim={d}" for p, d in checked[:20])
+    details = "\n".join(f"  {p} -> obs_dim={d}" for p, d in checked[:30])
     raise FileNotFoundError(
-        f"{EXPECTED_OBS_DIM}次元Actorが見つかりません。ACTOR_CHECKPOINTを指定してください。"
+        f"{EXPECTED_OBS_DIM}次元v5 Actorが見つかりません。ACTOR_CHECKPOINTを指定してください。"
         + ("\n確認した候補:\n" + details if details else "")
     )
 
@@ -380,10 +623,12 @@ def find_actor_checkpoint():
 def find_norm_checkpoint(actor_path):
     if NORM_CHECKPOINT is not None:
         p = Path(NORM_CHECKPOINT)
-        return p if p.is_absolute() else WORK_DIR / p
+        p = p if p.is_absolute() else WORK_DIR / p
+        if not p.is_file():
+            raise FileNotFoundError(f"NORM_CHECKPOINTがありません: {p}")
+        return p
 
-    # foo_actor_500Kit.pt -> foo_norm_500Kit.npz
-    expected = actor_path.with_name(actor_path.name.replace("_actor_", "_norm_").replace(".pt", ".npz"))
+    expected = actor_path.with_name(actor_path.name.replace("_actor_", "_norm_").replace("_full_", "_norm_").replace(".pt", ".npz"))
     if expected.is_file():
         return expected
 
@@ -397,21 +642,31 @@ def find_norm_checkpoint(actor_path):
     for p in sorted(candidates, key=lambda p: (numeric_suffix(p), p.stat().st_mtime), reverse=True):
         try:
             z = np.load(p)
-            if int(np.asarray(z["mean"]).size) == EXPECTED_OBS_DIM:
+            if int(np.asarray(z["mean"]).size) == EXPECTED_OBS_DIM and int(np.asarray(z["var"]).size) == EXPECTED_OBS_DIM:
                 return p
         except Exception:
             pass
-    raise FileNotFoundError("対応するnorm npzが見つかりません。NORM_CHECKPOINTを指定してください。")
+    raise FileNotFoundError(
+        f"対応する{EXPECTED_OBS_DIM}次元norm npzが見つかりません。NORM_CHECKPOINTを指定してください。"
+    )
 
 
 actor_path = find_actor_checkpoint()
-actor_state = extract_actor_state(torch_load(actor_path))
+checkpoint_obj = torch_load(actor_path)
+actor_state, actor_config = extract_actor_state_and_config(checkpoint_obj)
 actual_obs_dim = infer_obs_dim_from_state(actor_state)
 if actual_obs_dim != EXPECTED_OBS_DIM:
-    raise ValueError(
-        f"このビューアは{EXPECTED_OBS_DIM}次元用ですが、checkpointは{actual_obs_dim}次元です: {actor_path}"
-    )
-actor = actor_from_state(actor_state)
+    raise ValueError(f"このビューアは{EXPECTED_OBS_DIM}次元v5用ですが、checkpointは{actual_obs_dim}次元です: {actor_path}")
+
+try:
+    actor = ViewerV5SpikeActor(actor_state, actor_config).to(TORCH_DEVICE).eval()
+except Exception as exc:
+    raise RuntimeError(
+        "v5 Actor構造をcheckpointから復元できませんでした。\n"
+        f"原因: {exc}\n\nstate_dict keys/shapes:\n{_state_shapes(actor_state)}"
+    ) from exc
+for parameter in actor.parameters():
+    parameter.requires_grad_(False)
 
 norm_path = find_norm_checkpoint(actor_path)
 norm_npz = np.load(norm_path)
@@ -421,10 +676,12 @@ if obs_mean.numel() != EXPECTED_OBS_DIM or obs_var.numel() != EXPECTED_OBS_DIM:
     raise ValueError(
         f"norm次元が不一致です: mean={obs_mean.numel()}, var={obs_var.numel()}, expected={EXPECTED_OBS_DIM}"
     )
+if torch.any(obs_var < 0):
+    raise ValueError("norm varに負値があります")
 
 print("Actor:", actor_path)
 print("Norm :", norm_path)
-print(f"obs={actor.obs_dim}, action={actor.act_dim}, mem={actor.mem_dim}")
+actor.describe()
 
 
 # ============================================================
@@ -486,7 +743,7 @@ class KeyboardPolicy:
             -50.0, 50.0,
         )
         action, self.mem = self.actor(norm, self.mem)
-        return torch.clamp(action[0], -1.0, 1.0).cpu().numpy()
+        return torch.clamp(action[0], -ACTION_CLIP, ACTION_CLIP).cpu().numpy()
 
 
 class Go2KeyboardViewer:
@@ -500,6 +757,7 @@ class Go2KeyboardViewer:
         self.terrain = start_terrain
         self.command = np.zeros(3, dtype=np.float32)
         self.last_action = np.zeros(12, dtype=np.float32)
+        self.phase_step = 0
         self.quit_requested = False
         self.switch_to = None
         self.reset_requested = False
@@ -523,13 +781,14 @@ class Go2KeyboardViewer:
   Esc   : 終了
 
 現在の指令上限:
-  vx = ±0.60 m/s, vy = ±0.30 m/s, wz = ±1.00 rad/s
+  vx = ±0.60 m/s, vy = ±0.60 m/s, wz = ±1.00 rad/s
 """)
 
     def status(self):
         print(
             f"地形={self.terrain:6s}  "
-            f"cmd=[vx {self.command[0]:+.2f}, vy {self.command[1]:+.2f}, wz {self.command[2]:+.2f}]"
+            f"cmd=[vx {self.command[0]:+.2f}, vy {self.command[1]:+.2f}, wz {self.command[2]:+.2f}]  "
+            f"phase={self.phase_step:02d}/{GAIT_CYCLE_STEPS}"
         )
         self.update_title()
 
@@ -588,13 +847,30 @@ class Go2KeyboardViewer:
     def prepare_model(self, scene_path):
         model = mujoco.MjModel.from_xml_path(str(scene_path))
         data = mujoco.MjData(model)
-        model.actuator_ctrllimited[:] = 0
-        model.actuator_ctrlrange[:] = np.array([-1e6, 1e6])
+        if model.nu != 12:
+            raise RuntimeError(f"Go2の12 actuatorを想定していますが nu={model.nu} です")
+
+        # 学習Notebookと同じtorque limit選択:
+        # actuator_forcerange -> ctrlrange -> Go2 URDF fallback の順。
+        force_range = np.asarray(model.actuator_forcerange, dtype=np.float64)
+        force_limited = np.asarray(model.actuator_forcelimited).reshape(-1) > 0
+        force_lim = np.max(np.abs(force_range), axis=1)
+        ctrl_range = np.asarray(model.actuator_ctrlrange, dtype=np.float64)
+        ctrl_limited = np.asarray(model.actuator_ctrllimited).reshape(-1) > 0
+        ctrl_lim = np.max(np.abs(ctrl_range), axis=1)
+        valid_force = force_limited & np.isfinite(force_lim) & (force_lim > 1.0) & (force_lim < 1e4)
+        valid_ctrl = ctrl_limited & np.isfinite(ctrl_lim) & (ctrl_lim > 1.0) & (ctrl_lim < 1e4)
+        torque_limits = np.where(valid_force, force_lim, np.where(valid_ctrl, ctrl_lim, FALLBACK_TORQUE_LIMIT))
+        model.actuator_ctrllimited[:] = 1
+        model.actuator_ctrlrange[:, 0] = -torque_limits
+        model.actuator_ctrlrange[:, 1] = torque_limits
+
         model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
         model.opt.iterations = 8
         if hasattr(model.opt, "ls_iterations"):
             model.opt.ls_iterations = 8
-        return model, data
+        print("torque limit [Nm]:", np.array2string(torque_limits, precision=2))
+        return model, data, torque_limits
 
     def reset_robot(self, model, data):
         mujoco.mj_resetData(model, data)
@@ -603,6 +879,7 @@ class Go2KeyboardViewer:
         data.qpos[7:19] = standing_pose_viewer()
         data.qvel[:] = 0.0
         self.last_action[:] = 0.0
+        self.phase_step = 0
         self.policy.reset()
         mujoco.mj_forward(model, data)
 
@@ -610,8 +887,11 @@ class Go2KeyboardViewer:
         joint_angle = data.sensordata[addresses["pos"]:addresses["pos"] + 12] - default_sensor
         joint_velocity = data.sensordata[addresses["vel"]:addresses["vel"] + 12]
         gyro = data.sensordata[addresses["gyro"]:addresses["gyro"] + 3]
-        # 45D APEX標準: gyro*0.25 + projected gravity + command scale + q + dq*0.05 + previous action
+        # v5 47D: APEX標準45D + gait phase sin/cos。
+        # phaseはAction Prior/模倣軌道の周期 T_GAIT=0.40s に合わせ、制御stepごとに進める。
         projected_gravity = projected_gravity_from_quat(data.qpos[3:7])
+        phase = 2.0 * np.pi * (self.phase_step % GAIT_CYCLE_STEPS) / GAIT_CYCLE_STEPS
+        phase_obs = np.array([np.sin(phase), np.cos(phase)], dtype=np.float32)
         obs = np.concatenate([
             gyro * 0.25,
             projected_gravity,
@@ -619,6 +899,7 @@ class Go2KeyboardViewer:
             joint_angle,
             joint_velocity * 0.05,
             self.last_action,
+            phase_obs,
         ])
         obs = np.asarray(obs, dtype=np.float32)
         if obs.size != EXPECTED_OBS_DIM:
@@ -643,7 +924,7 @@ class Go2KeyboardViewer:
         glfw.swap_buffers(self.window)
 
     def run_scene(self):
-        model, data = self.prepare_model(self.scenes[self.terrain])
+        model, data, torque_limits = self.prepare_model(self.scenes[self.terrain])
         default_qpos = standing_pose_viewer()
         default_sensor = default_qpos[PERM]
         joint_low = model.jnt_range[1:, 0][PERM]
@@ -666,7 +947,7 @@ class Go2KeyboardViewer:
         glfw.window_hint(glfw.SAMPLES, 0)
         glfw.window_hint(glfw.RESIZABLE, glfw.FALSE)
         window = glfw.create_window(WINDOW_WIDTH, WINDOW_HEIGHT,
-                                    f"Go2 {EXPECTED_OBS_DIM}D keyboard viewer", None, None)
+                                    f"Go2 APEX v5 {EXPECTED_OBS_DIM}D keyboard viewer", None, None)
         if window is None:
             glfw.terminate()
             raise RuntimeError("GLFW window could not be created")
@@ -724,16 +1005,19 @@ class Go2KeyboardViewer:
 
                     obs = self.observation(model, data, default_sensor, addresses)
                     action = self.policy.act(obs)
+                    action = np.clip(action, -ACTION_CLIP, ACTION_CLIP)
                     target = np.clip(default_sensor + action * ACT_SCALE, joint_low, joint_high)
 
                     for _ in range(frame_skip):
                         position = data.qpos[7:19][PERM]
                         velocity = data.qvel[6:18][PERM]
-                        data.ctrl[:] = SERVO_KP * (target - position) - SERVO_KD * velocity
+                        torque = SERVO_KP * (target - position) - SERVO_KD * velocity
+                        data.ctrl[:] = np.clip(torque, -torque_limits, torque_limits)
                         mujoco.mj_step(model, data)
 
-                    # 45D版では次stepのprevious actionになる。33D版では観測に使わない。
+                    # 次stepのprevious actionとphase。学習環境と同じく制御後にphaseを1つ進める。
                     self.last_action[:] = action
+                    self.phase_step = (self.phase_step + 1) % GAIT_CYCLE_STEPS
                     control_steps += 1
                     next_control += control_dt
                     if next_control < time.perf_counter() - control_dt:
